@@ -1,2 +1,2 @@
-Follow path . > openlayers-test > src 
+Follow path . > openlayers-test > src, 
 NOT . > src
