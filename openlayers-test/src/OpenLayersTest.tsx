@@ -1,4 +1,4 @@
-﻿import React, { useEffect, useMemo, useRef } from "react";
+﻿import React, { useEffect, useRef } from "react";
 
 import Map from "ol/Map.js";
 import View from "ol/View.js";
@@ -19,7 +19,39 @@ import Fill from "ol/style/Fill.js";
 import Text from "ol/style/Text.js";
 import type MapBrowserEvent from "ol/MapBrowserEvent.js";
 
+// Constants
 const TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
+const DEFAULT_CENTER: [number, number] = [-84.39, 33.75]; // [lon, lat]
+const DEFAULT_ZOOM = 12;
+const ANIMATION_DURATION = 650;
+
+// Heatmap configuration
+const HEATMAP_CONFIG = {
+    blur: 26,
+    radius: 16,
+} as const;
+
+// Risk color thresholds
+const RISK_COLORS = {
+    high: { threshold: 80, fill: "rgba(255, 59, 48, 0.06)", stroke: "rgba(255, 59, 48, 1)" },
+    medium: { threshold: 60, fill: "rgba(255, 149, 0, 0.05)", stroke: "rgba(255, 149, 0, 1)" },
+    low: { threshold: 40, fill: "rgba(255, 204, 0, 0.04)", stroke: "rgba(255, 204, 0, 1)" },
+    minimal: { threshold: 0, fill: "rgba(52, 199, 89, 0.035)", stroke: "rgba(52, 199, 89, 1)" },
+} as const;
+
+// Popup styling
+const POPUP_STYLE = {
+    background: "rgba(30,30,30,0.95)",
+    color: "#fff",
+    border: "1px solid rgba(255,255,255,0.12)",
+    borderRadius: "10px",
+    padding: "10px 12px",
+    fontFamily: "system-ui, sans-serif",
+    fontSize: "13px",
+    minWidth: "220px",
+    boxShadow: "0 8px 24px rgba(0,0,0,0.4)",
+    pointerEvents: "auto",
+} as const;
 
 // Types
 export type OLInfo = {
@@ -33,7 +65,6 @@ export type GoToRequest = {
     zoom?: number;
     dropMarker?: boolean;
     mgrs?: string;
-    seq?: number; // forces re-run even if same coords
 };
 
 export type OpenLayersTestProps = {
@@ -44,7 +75,20 @@ export type OpenLayersTestProps = {
     onInfo?: (info: OLInfo) => void;
     onLastClick?: (latLon: [number, number] | null) => void;
     onMarkersCount?: (count: number) => void;
-    requestClearMarkersToken?: number;
+    requestClearMarkers?: number;
+    seedZones?: Array<{
+        name: string;
+        coordinates: Array<[number, number]>; // [lon, lat]
+        riskScore: number;
+        reason?: string;
+        owner?: string;
+    }>;
+    seedHeatPoints?: Array<{
+        lon: number;
+        lat: number;
+        weight: number;
+        name?: string;
+    }>;
 };
 
 type FeatureProps = {
@@ -80,24 +124,17 @@ function markerStyle(): Style {
     });
 }
 
-function riskFill(score: number): string {
-    if (score >= 80) return "rgba(255, 59, 48, 0.06)";
-    if (score >= 60) return "rgba(255, 149, 0, 0.05)";
-    if (score >= 40) return "rgba(255, 204, 0, 0.04)";
-    return "rgba(52, 199, 89, 0.035)";
-}
-
-function riskStroke(score: number): string {
-    if (score >= 80) return "rgba(255, 59, 48, 1)";
-    if (score >= 60) return "rgba(255, 149, 0, 1)";
-    if (score >= 40) return "rgba(255, 204, 0, 1)";
-    return "rgba(52, 199, 89, 1)";
+function getRiskColor(score: number, type: "fill" | "stroke"): string {
+    if (score >= RISK_COLORS.high.threshold) return RISK_COLORS.high[type];
+    if (score >= RISK_COLORS.medium.threshold) return RISK_COLORS.medium[type];
+    if (score >= RISK_COLORS.low.threshold) return RISK_COLORS.low[type];
+    return RISK_COLORS.minimal[type];
 }
 
 function polygonRiskStyle(name: string, score: number): Style {
     return new Style({
-        stroke: new Stroke({ width: 2, color: riskStroke(score) }),
-        fill: new Fill({ color: riskFill(score) }),
+        stroke: new Stroke({ width: 2, color: getRiskColor(score, "stroke") }),
+        fill: new Fill({ color: getRiskColor(score, "fill") }),
         text: new Text({
             text: `${name}\nRisk ${score}`,
             font: "bold 12px system-ui, sans-serif",
@@ -149,8 +186,10 @@ export default function OpenLayersTest(props: OpenLayersTestProps) {
         onInfo,
         onLastClick,
         onMarkersCount,
-        requestClearMarkersToken,
+        requestClearMarkers,
         goToRequest,
+        seedZones,
+        seedHeatPoints,
     } = props;
 
     const mapDivRef = useRef<HTMLDivElement | null>(null);
@@ -167,8 +206,8 @@ export default function OpenLayersTest(props: OpenLayersTestProps) {
     const heatLayerRef = useRef(
         new HeatmapLayer({
             source: heatSourceRef.current,
-            blur: 26,
-            radius: 16,
+            blur: HEATMAP_CONFIG.blur,
+            radius: HEATMAP_CONFIG.radius,
         })
     );
 
@@ -177,7 +216,6 @@ export default function OpenLayersTest(props: OpenLayersTestProps) {
     const popupOverlayRef = useRef<Overlay | null>(null);
 
     const markersCountRef = useRef(0);
-    const centerLonLat: [number, number] = useMemo(() => [-84.39, 33.75], []);
 
     // Initialize map
     useEffect(() => {
@@ -192,8 +230,8 @@ export default function OpenLayersTest(props: OpenLayersTestProps) {
         });
 
         const view = new View({
-            center: fromLonLat(centerLonLat),
-            zoom: 12,
+            center: fromLonLat(DEFAULT_CENTER),
+            zoom: DEFAULT_ZOOM,
         });
 
         const map = new Map({
@@ -204,18 +242,7 @@ export default function OpenLayersTest(props: OpenLayersTestProps) {
 
         // Create and configure popup overlay
         const popupEl = document.createElement("div");
-        Object.assign(popupEl.style, {
-            background: "rgba(30,30,30,0.95)",
-            color: "#fff",
-            border: "1px solid rgba(255,255,255,0.12)",
-            borderRadius: "10px",
-            padding: "10px 12px",
-            fontFamily: "system-ui, sans-serif",
-            fontSize: "13px",
-            minWidth: "220px",
-            boxShadow: "0 8px 24px rgba(0,0,0,0.4)",
-            pointerEvents: "auto",
-        });
+        Object.assign(popupEl.style, POPUP_STYLE);
 
         const popup = new Overlay({
             element: popupEl,
@@ -228,36 +255,55 @@ export default function OpenLayersTest(props: OpenLayersTestProps) {
         popupElRef.current = popupEl;
         popupOverlayRef.current = popup;
 
-        // Seed zones
-        const zoneA = new Feature(
-            new Polygon([
-                [
-                    fromLonLat([-84.42, 33.74]),
-                    fromLonLat([-84.36, 33.74]),
-                    fromLonLat([-84.36, 33.77]),
-                    fromLonLat([-84.42, 33.77]),
-                    fromLonLat([-84.42, 33.74]),
+        // Seed zones (use props or default)
+        const zonesToSeed = seedZones ?? [
+            {
+                name: "Zone A",
+                coordinates: [
+                    [-84.42, 33.74],
+                    [-84.36, 33.74],
+                    [-84.36, 33.77],
+                    [-84.42, 33.77],
+                    [-84.42, 33.74],
                 ],
-            ])
-        );
-        zoneA.setProperties({ type: "zone", name: "Zone A", riskScore: 82, reason: "N/A" });
-        zoneA.setStyle(polygonRiskStyle("Zone A", 82));
-        zonesSourceRef.current.addFeature(zoneA);
+                riskScore: 82,
+                reason: "N/A",
+            },
+        ];
 
-        // Seed heat points
-        heatSourceRef.current.addFeatures([
-            makeHeatPoint(-84.395, 33.755, 0.9, "Incident Cluster 1"),
-            makeHeatPoint(-84.392, 33.752, 0.8, "Incident Cluster 1"),
-            makeHeatPoint(-84.388, 33.754, 0.7, "Incident Cluster 1"),
-            makeHeatPoint(-84.405, 33.765, 1.0, "Incident Cluster 2"),
-            makeHeatPoint(-84.401, 33.763, 0.8, "Incident Cluster 2"),
-            makeHeatPoint(-84.41, 33.748, 0.65, "Incident Cluster 3"),
-        ]);
+        zonesToSeed.forEach((zone) => {
+            const feature = new Feature(
+                new Polygon([zone.coordinates.map((coord) => fromLonLat(coord))])
+            );
+            feature.setProperties({
+                type: "zone",
+                name: zone.name,
+                riskScore: zone.riskScore,
+                reason: zone.reason,
+                owner: zone.owner,
+            });
+            feature.setStyle(polygonRiskStyle(zone.name, zone.riskScore));
+            zonesSourceRef.current.addFeature(feature);
+        });
+
+        // Seed heat points (use props or default)
+        const heatPointsToSeed = seedHeatPoints ?? [
+            { lon: -84.395, lat: 33.755, weight: 0.9, name: "Incident Cluster 1" },
+            { lon: -84.392, lat: 33.752, weight: 0.8, name: "Incident Cluster 1" },
+            { lon: -84.388, lat: 33.754, weight: 0.7, name: "Incident Cluster 1" },
+            { lon: -84.405, lat: 33.765, weight: 1.0, name: "Incident Cluster 2" },
+            { lon: -84.401, lat: 33.763, weight: 0.8, name: "Incident Cluster 2" },
+            { lon: -84.41, lat: 33.748, weight: 0.65, name: "Incident Cluster 3" },
+        ];
+
+        heatSourceRef.current.addFeatures(
+            heatPointsToSeed.map((pt) => makeHeatPoint(pt.lon, pt.lat, pt.weight, pt.name))
+        );
 
         // Update HUD info
         const updateInfo = () => {
             const zoom = view.getZoom() ?? 0;
-            const center = toLonLat(view.getCenter() ?? fromLonLat(centerLonLat)) as [number, number];
+            const center = toLonLat(view.getCenter() ?? fromLonLat(DEFAULT_CENTER)) as [number, number];
             onInfo?.({ zoom, centerLatLon: [center[1], center[0]] });
         };
         map.on("moveend", updateInfo);
@@ -326,13 +372,14 @@ export default function OpenLayersTest(props: OpenLayersTestProps) {
         return () => {
             map.un("singleclick", clickHandler);
             map.un("contextmenu", contextMenuHandler);
+            map.un("moveend", updateInfo);
             mapDiv.removeEventListener("contextmenu", preventContextMenu);
             map.setTarget(undefined);
             mapRef.current = null;
             popupElRef.current = null;
             popupOverlayRef.current = null;
         };
-    }, [centerLonLat, onInfo, onLastClick, onMarkersCount]);
+    }, [onInfo, onLastClick, onMarkersCount, seedZones, seedHeatPoints]);
 
     // Layer visibility effects
     useEffect(() => {
@@ -349,12 +396,12 @@ export default function OpenLayersTest(props: OpenLayersTestProps) {
 
     // Clear markers effect
     useEffect(() => {
-        if (requestClearMarkersToken == null) return;
+        if (requestClearMarkers == null) return;
         markersSourceRef.current.clear();
         markersCountRef.current = 0;
         onMarkersCount?.(0);
         popupOverlayRef.current?.setPosition(undefined);
-    }, [requestClearMarkersToken, onMarkersCount]);
+    }, [requestClearMarkers, onMarkersCount]);
 
     // Go to request effect
     useEffect(() => {
@@ -364,7 +411,7 @@ export default function OpenLayersTest(props: OpenLayersTestProps) {
         const view = mapRef.current.getView();
         const coord = fromLonLat([lon, lat]);
 
-        view.animate({ center: coord, zoom, duration: 650 });
+        view.animate({ center: coord, zoom, duration: ANIMATION_DURATION });
 
         if (dropMarker && markersLayerRef.current.getVisible()) {
             const marker = new Feature({ geometry: new Point(coord) });
@@ -380,7 +427,7 @@ export default function OpenLayersTest(props: OpenLayersTestProps) {
             markersCountRef.current += 1;
             onMarkersCount?.(markersCountRef.current);
         }
-    }, [goToRequest?.seq, onMarkersCount]);
+    }, [goToRequest, onMarkersCount]);
 
     return <div ref={mapDivRef} style={{ width: "100%", height: "100%" }} />;
 }
