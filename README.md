@@ -1,2 +1,2 @@
-Follow path . > openlayers-test > src, 
-NOT . > src
+Follow ./ openlayers-test/ src
+and NOT ./ src
